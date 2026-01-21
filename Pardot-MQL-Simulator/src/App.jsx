@@ -71,6 +71,71 @@ function roundToStep(n, step) {
   return Math.round(n / step) * step;
 }
 
+/**
+ * Minimal CSV parser:
+ * - supports commas and quoted fields with "" escaping
+ * - ignores empty lines
+ * - returns array of rows (arrays of strings)
+ */
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1];
+
+    if (inQuotes) {
+      if (c === '"' && next === '"') {
+        field += '"';
+        i++;
+      } else if (c === '"') {
+        inQuotes = false;
+      } else {
+        field += c;
+      }
+      continue;
+    }
+
+    if (c === '"') {
+      inQuotes = true;
+      continue;
+    }
+
+    if (c === ",") {
+      row.push(field.trim());
+      field = "";
+      continue;
+    }
+
+    if (c === "\n") {
+      row.push(field.trim());
+      field = "";
+      const allEmpty = row.every((x) => (x ?? "").trim() === "");
+      if (!allEmpty) rows.push(row);
+      row = [];
+      continue;
+    }
+
+    if (c === "\r") continue;
+
+    field += c;
+  }
+
+  // final field
+  row.push(field.trim());
+  const allEmpty = row.every((x) => (x ?? "").trim() === "");
+  if (!allEmpty) rows.push(row);
+
+  return rows;
+}
+
+function normalizeHeader(h) {
+  return (h || "").trim().toLowerCase();
+}
+
 export default function App() {
   // ----- Stage / Stepper -----
   const [stepIndex, setStepIndex] = useState(0);
@@ -103,26 +168,45 @@ export default function App() {
   // ----- Import / Export -----
   const importInputRef = useRef(null);
 
-  const exportConfig = () => {
-    const payload = {
-      scoringModel,
-      gradingRules,
-      mqlThreshold,
-      gradeThreshold
-    };
+  const csvEscape = (v) => {
+  const s = String(v ?? "");
+  // Quote if it contains comma, quote, or newline
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+};
 
-    const json = JSON.stringify(payload, null, 2);
-    const blob = new Blob([json], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
+const exportConfig = () => {
+  const lines = [];
+  lines.push(["type", "key", "value", "weight"].join(","));
 
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "mql-architect-config.json";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
+  // thresholds
+  lines.push(["threshold", "mqlThreshold", mqlThreshold, ""].map(csvEscape).join(","));
+  lines.push(["threshold", "gradeThreshold", gradeThreshold, ""].map(csvEscape).join(","));
+
+  // scoring
+  Object.keys(scoringModel)
+    .sort()
+    .forEach((activity) => {
+      lines.push(["scoring", activity, scoringModel[activity], ""].map(csvEscape).join(","));
+    });
+
+  // grading
+  gradingRules.forEach((r) => {
+    lines.push(["grading", r.category, r.value, r.weight].map(csvEscape).join(","));
+  });
+
+  const csv = lines.join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "mql-architect-config.csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
 
   const triggerImport = () => importInputRef.current?.click();
 
@@ -131,46 +215,91 @@ export default function App() {
 
     try {
       const text = await file.text();
-      const data = JSON.parse(text);
+      const rows = parseCsv(text);
 
-      // scoringModel import/merge
-      if (data.scoringModel && typeof data.scoringModel === "object") {
-        setScoringModel((prev) => {
-          const merged = { ...prev };
-          for (const [k, v] of Object.entries(data.scoringModel)) {
-            merged[k] = Number.isFinite(Number(v)) ? parseInt(v, 10) : 0;
+      if (rows.length < 2) return;
+
+      // Build header map
+      const header = rows[0].map(normalizeHeader);
+      const idx = (name) => header.indexOf(normalizeHeader(name));
+
+      const typeIdx = idx("type");
+      const keyIdx = idx("key");
+      const valueIdx = idx("value");
+      const weightIdx = idx("weight");
+
+      // Require at least: type, key, value
+      if (typeIdx === -1 || keyIdx === -1 || valueIdx === -1) return;
+
+      // Collect updates
+      const scoringUpdates = {};
+      const newGrading = [];
+      let importedMqlThreshold = null;
+      let importedGradeThreshold = null;
+
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r];
+        const type = (row[typeIdx] || "").trim().toLowerCase();
+        const key = (row[keyIdx] || "").trim();
+        const value = (row[valueIdx] || "").trim();
+        const weightRaw = weightIdx >= 0 ? (row[weightIdx] || "").trim() : "";
+
+        if (!type || !key) continue;
+
+        if (type === "scoring") {
+          // Merge: allow new keys too
+          const n = parseInt(value, 10);
+          scoringUpdates[key] = Number.isFinite(n) ? n : 0;
+          continue;
+        }
+
+        if (type === "grading") {
+          const w = parseInt(weightRaw, 10);
+          newGrading.push({
+            category: GRADING_CRITERIA_OPTIONS.includes(key) ? key : "Country",
+            value: value,
+            weight: [0, 1, 2, 3].includes(w) ? w : 0
+          });
+          continue;
+        }
+
+        if (type === "threshold") {
+          if (key === "mqlthreshold") {
+            const n = parseInt(value, 10);
+            if (Number.isFinite(n)) importedMqlThreshold = n;
           }
-          return merged;
-        });
+          if (key === "gradethreshold") {
+            if (GRADE_LADDER.includes(value)) importedGradeThreshold = value;
+          }
+        }
       }
 
-      // gradingRules import (replace if valid array)
-      if (Array.isArray(data.gradingRules)) {
-        const cleaned = data.gradingRules
-          .filter((r) => r && typeof r === "object")
-          .map((r, idx) => ({
-            id: Number.isFinite(Number(r.id)) ? parseInt(r.id, 10) : idx + 1,
-            category: GRADING_CRITERIA_OPTIONS.includes(r.category) ? r.category : "Country",
-            value: typeof r.value === "string" ? r.value : "",
-            weight: [0, 1, 2, 3].includes(Number(r.weight)) ? parseInt(r.weight, 10) : 0
-          }));
-        setGradingRules(cleaned);
+      // Apply scoring merges
+      if (Object.keys(scoringUpdates).length > 0) {
+        setScoringModel((prev) => ({ ...prev, ...scoringUpdates }));
       }
 
-      // thresholds (optional)
-      if (Number.isFinite(Number(data.mqlThreshold))) {
-        const v = clamp(roundToStep(parseInt(data.mqlThreshold, 10), 5), 0, 300);
+      // Apply grading replace (if any grading rows exist)
+      if (newGrading.length > 0) {
+        setGradingRules(
+          newGrading.map((r, i) => ({
+            id: i + 1,
+            category: r.category,
+            value: r.value,
+            weight: r.weight
+          }))
+        );
+      }
+
+      // Apply thresholds
+      if (importedMqlThreshold !== null) {
+        const v = clamp(roundToStep(importedMqlThreshold, 5), 0, 300);
         setMqlThreshold(v);
       }
-
-      if (typeof data.gradeThreshold === "string" && GRADE_LADDER.includes(data.gradeThreshold)) {
-        setGradeThreshold(data.gradeThreshold);
-      }
+      if (importedGradeThreshold) setGradeThreshold(importedGradeThreshold);
     } catch {
-      // If you want a toast later, this is where it would go.
-      // For now: fail silently.
+      // Fail silently for now
     } finally {
-      // Allow re-importing the same file by clearing input
       if (importInputRef.current) importInputRef.current.value = "";
     }
   };
@@ -185,7 +314,7 @@ export default function App() {
   }, [simActivities, scoringModel]);
 
   const calculateGrade = useMemo(() => {
-    let steps = BASE_GRADE_INDEX; // Start at D
+    let steps = BASE_GRADE_INDEX;
 
     gradingRules.forEach((rule) => {
       const userValue = simProfile[rule.category];
@@ -275,21 +404,21 @@ export default function App() {
         <input
           ref={importInputRef}
           type="file"
-          accept="application/json"
+          accept=".csv,text/csv"
           className="hidden"
           onChange={(e) => handleImportFile(e.target.files?.[0])}
         />
         <button
           onClick={triggerImport}
           className="px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
-          title="Import scoring/grading configuration (JSON)"
+          title="Import configuration (CSV)"
         >
-          <Upload size={16} /> Import
+          <Upload size={16} /> Import CSV
         </button>
         <button
           onClick={exportConfig}
           className="px-3 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
-          title="Export scoring/grading configuration (JSON)"
+          title="Export configuration (JSON)"
         >
           <Download size={16} /> Export
         </button>
@@ -348,11 +477,10 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-6">
         <TopActions />
 
-        {/* --- STEP 1: SCORING --- */}
+        {/* STEP 1: SCORING */}
         {activeStep === "scoring" && (
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
             <div className="p-6 border-b border-slate-100 bg-slate-50/50">
@@ -369,10 +497,7 @@ export default function App() {
               {Object.keys(scoringModel)
                 .sort()
                 .map((key) => (
-                  <div
-                    key={key}
-                    className="flex items-center justify-between group p-2 rounded-lg hover:bg-slate-50 transition-colors"
-                  >
+                  <div key={key} className="flex items-center justify-between group p-2 rounded-lg hover:bg-slate-50 transition-colors">
                     <label className="text-sm font-medium text-slate-700 truncate pr-4" title={key}>
                       {key}
                     </label>
@@ -392,7 +517,7 @@ export default function App() {
           </div>
         )}
 
-        {/* --- STEP 2: GRADING --- */}
+        {/* STEP 2: GRADING */}
         {activeStep === "grading" && (
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
             <div className="p-6 border-b border-slate-100 bg-slate-50/50 flex justify-between items-center">
@@ -414,9 +539,7 @@ export default function App() {
             </div>
 
             <div className="p-6 space-y-3">
-              {gradingRules.length === 0 && (
-                <div className="text-center py-10 text-slate-400 italic">No grading rules defined yet.</div>
-              )}
+              {gradingRules.length === 0 && <div className="text-center py-10 text-slate-400 italic">No grading rules defined yet.</div>}
 
               {gradingRules.map((rule) => (
                 <div
@@ -483,12 +606,10 @@ export default function App() {
           </div>
         )}
 
-        {/* --- STEP 3: SIMULATOR --- */}
+        {/* STEP 3: SIMULATOR */}
         {activeStep === "simulator" && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Left: Config + Inputs */}
             <div className="lg:col-span-2 space-y-6">
-              {/* Thresholds */}
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
                 <h3 className="font-semibold text-slate-800 mb-4 flex items-center gap-2">
                   <Settings size={18} className="text-slate-500" />
@@ -510,9 +631,7 @@ export default function App() {
                           onChange={(e) => setThresholdFromAnyInput(e.target.value)}
                           className="flex-1 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
                         />
-                        <span className="w-14 text-center font-bold text-blue-600 bg-blue-50 py-1 rounded">
-                          {mqlThreshold}
-                        </span>
+                        <span className="w-14 text-center font-bold text-blue-600 bg-blue-50 py-1 rounded">{mqlThreshold}</span>
                       </div>
 
                       <div className="flex items-center gap-3">
@@ -547,7 +666,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Profile Builder */}
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
                 <h3 className="font-semibold text-slate-800 mb-4 flex items-center gap-2">
                   <Users size={18} className="text-slate-500" />
@@ -577,7 +695,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Activity Builder */}
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
                 <h3 className="font-semibold text-slate-800 mb-4 flex items-center gap-2">
                   <TrendingUp size={18} className="text-slate-500" />
@@ -620,13 +737,11 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Stepper footer for simulator too */}
               <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4">
                 <StepFooter />
               </div>
             </div>
 
-            {/* Right: Results */}
             <div className="lg:col-span-1">
               <div className="sticky top-8 space-y-4">
                 <div
