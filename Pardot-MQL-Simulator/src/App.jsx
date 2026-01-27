@@ -131,6 +131,99 @@ function parseCsv(text) {
 
   return rows;
 }
+function parseNumberWithSuffix(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim();
+
+  // remove common noise
+  s = s.replace(/,/g, "");
+  s = s.replace(/\s+/g, "");
+  s = s.replace(/^\$/g, ""); // leading $
+  s = s.replace(/^\+/g, "");
+
+  // match: 123, 123.4, 123M, 123.4m, 123K, 123B etc
+  const m = s.match(/(-?\d+(?:\.\d+)?)([kmb])?/i);
+  if (!m) return null;
+
+  const num = Number(m[1]);
+  if (!Number.isFinite(num)) return null;
+
+  const suffix = (m[2] || "").toLowerCase();
+  const mult = suffix === "k" ? 1e3 : suffix === "m" ? 1e6 : suffix === "b" ? 1e9 : 1;
+
+  return num * mult;
+}
+
+/**
+ * Parses band expressions like:
+ * - "1000+"
+ * - "Under 250" / "Below 250"
+ * - "250-999"
+ * - "$100M-$499M"
+ * - "$500M+"
+ * Returns:
+ *   { kind: "min", min } | { kind: "max", max, exclusive } | { kind: "range", min, max } | null
+ */
+function parseBand(valueStr) {
+  if (!valueStr) return null;
+  const s0 = String(valueStr).trim();
+  const s = s0.toLowerCase();
+
+  // Under / below / less than -> max (exclusive)
+  if (s.startsWith("under ") || s.startsWith("below ") || s.startsWith("less than ") || s.startsWith("<")) {
+    const n = parseNumberWithSuffix(s0);
+    if (n == null) return null;
+    return { kind: "max", max: n, exclusive: true };
+  }
+
+  // Over / above / greater than -> min (inclusive)
+  if (s.startsWith("over ") || s.startsWith("above ") || s.startsWith("greater than ") || s.startsWith(">")) {
+    const n = parseNumberWithSuffix(s0);
+    if (n == null) return null;
+    return { kind: "min", min: n };
+  }
+
+  // Plus syntax -> min (inclusive)
+  if (s.includes("+")) {
+    const n = parseNumberWithSuffix(s0);
+    if (n == null) return null;
+    return { kind: "min", min: n };
+  }
+
+  // Range syntax: "250-999" or "$100M-$499M" (also accept en dash)
+  const rangeMatch = s0.split(/-|–/).map((x) => x.trim()).filter(Boolean);
+  if (rangeMatch.length === 2) {
+    const a = parseNumberWithSuffix(rangeMatch[0]);
+    const b = parseNumberWithSuffix(rangeMatch[1]);
+    if (a == null || b == null) return null;
+    const min = Math.min(a, b);
+    const max = Math.max(a, b);
+    return { kind: "range", min, max };
+  }
+
+  return null;
+}
+
+function matchesRuleValue(ruleValue, userValue) {
+  if (ruleValue == null || userValue == null) return false;
+
+  const band = parseBand(ruleValue);
+  if (!band) {
+    // exact (case-insensitive) match fallback
+    return String(userValue).trim().toLowerCase() === String(ruleValue).trim().toLowerCase();
+  }
+
+  // If ruleValue is a band, userValue must be numeric-ish
+  const userNum = parseNumberWithSuffix(userValue);
+  if (userNum == null) return false;
+
+  if (band.kind === "min") return userNum >= band.min;
+  if (band.kind === "max") return band.exclusive ? userNum < band.max : userNum <= band.max;
+  if (band.kind === "range") return userNum >= band.min && userNum <= band.max;
+
+  return false;
+}
+
 
 function normalizeHeader(h) {
   return (h || "").trim().toLowerCase();
@@ -318,9 +411,10 @@ const exportConfig = () => {
 
     gradingRules.forEach((rule) => {
       const userValue = simProfile[rule.category];
-      if (userValue && userValue.toLowerCase() === rule.value.toLowerCase()) {
+      if (userValue && matchesRuleValue(rule.value, userValue)) {
         steps += rule.weight;
-      }
+        }
+
     });
 
     steps = clamp(steps, 0, 12);
